@@ -1,0 +1,108 @@
+# Rebuilds the prebuilt libraop.a (and the cliraop test tool) that SpotConnect
+# links against, for the platforms a GitHub runner can produce. Artifacts are
+# downloaded and committed by hand to the airplay2-full branch.
+name: prebuilt
+
+on:
+  push:
+    branches: [ci]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04,     platform: x86_64,  cc: gcc, cxx: g++, ar: ar, native: true }
+          - { runner: ubuntu-22.04-arm, platform: aarch64, cc: gcc, cxx: g++, ar: ar, native: true }
+          - { runner: ubuntu-22.04,     platform: arm,     cc: arm-linux-gnueabihf-gcc, cxx: arm-linux-gnueabihf-g++, ar: arm-linux-gnueabihf-ar, pkgs: "gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf", native: false }
+    runs-on: ${{ matrix.runner }}
+    env:
+      P: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential ${{ matrix.pkgs }}
+          ${{ matrix.cc }} --version | head -1
+
+      - name: ABI of the upstream prebuilt archive
+        run: |
+          echo "--- targets/linux/$P/libraop.a (upstream)"
+          readelf -A targets/linux/$P/libraop.a 2>/dev/null | grep -E 'Tag_(CPU_arch|ABI_VFP_args|FP_arch|ABI_PCS_wchar_t)' | sort | uniq -c || true
+          readelf -h targets/linux/$P/libraop.a | grep -E 'Class|Machine' | sort | uniq -c
+          nm -g targets/linux/$P/libraop.a | grep -c raopcl_set_airplay2 || echo "upstream archive lacks raopcl_set_airplay2 (expected)"
+
+      - name: Build libraop
+        run: |
+          make ${{ matrix.native && 'all' || 'lib' }} STATIC=1 PLATFORM=$P HOST=linux CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} AR=${{ matrix.ar }} -j4
+          ls -la lib/linux/$P/libraop.a
+          echo "--- new archive"
+          readelf -A lib/linux/$P/libraop.a 2>/dev/null | grep -E 'Tag_(CPU_arch|ABI_VFP_args|FP_arch|ABI_PCS_wchar_t)' | sort | uniq -c || true
+          readelf -h lib/linux/$P/libraop.a | grep -E 'Class|Machine' | sort | uniq -c
+          nm -g lib/linux/$P/libraop.a | grep ' T raopcl_set_airplay2'
+
+      - name: cliraop smoke test
+        if: ${{ matrix.native }}
+        run: |
+          ls -la bin/cliraop-linux-$P
+          bin/cliraop-linux-$P -h 2>&1 | head -5 || true
+          bin/cliraop-linux-$P 2>&1 | grep -q -- '-2' && echo "cliraop has the -2 (AirPlay 2) option"
+
+      - name: Verify SpotConnect links against it
+        if: ${{ matrix.native }}
+        run: |
+          sudo apt-get install -y -q cmake libmbedtls-dev python3-protobuf protobuf-compiler python3-setuptools
+          git clone -q --depth 1 -b airplay2-full https://github.com/bartleman/SpotConnect sc
+          cd sc
+          git submodule update -q --init --depth 1
+          (cd common/cspot && git submodule update -q --init --recursive --depth 1)
+          cp "$GITHUB_WORKSPACE/lib/linux/$P/libraop.a" spotraop/libraop/targets/linux/$P/libraop.a
+          cp "$GITHUB_WORKSPACE/src/raop_client.h" spotraop/libraop/targets/include/raop_client.h
+          cd spotraop && mkdir build && cd build
+          cmake .. -DHOST=linux -DPLATFORM=$P
+          make -j4
+          ls -la spotraop-linux-$P*
+          ./spotraop-linux-$P -h 2>&1 | head -3 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libraop-linux-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            lib/linux/${{ matrix.platform }}/libraop.a
+            bin/cliraop-linux-${{ matrix.platform }}
+
+  # What a user does: clone the SpotConnect build branch and run cmake, nothing copied in.
+  verify-full:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04,     platform: x86_64 }
+          - { runner: ubuntu-22.04-arm, platform: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      P: ${{ matrix.platform }}
+    steps:
+      - name: Build SpotConnect airplay2-full as a user would
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential cmake libmbedtls-dev python3-protobuf protobuf-compiler python3-setuptools
+          git clone -q --depth 1 -b airplay2-full https://github.com/bartleman/SpotConnect sc
+          cd sc
+          git submodule update -q --init --depth 1
+          (cd common/cspot && git submodule update -q --init --recursive --depth 1)
+          echo "libraop:    $(git -C spotraop/libraop log --oneline -1)"
+          echo "crosstools: $(git -C common/crosstools log --oneline -1)"
+          cd spotraop && mkdir build && cd build
+          cmake ..
+          make -j4
+          ls -la spotraop-linux-$P*
+          nm spotraop-linux-$P | grep -c raopcl_set_airplay2 || true
